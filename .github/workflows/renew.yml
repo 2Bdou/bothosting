@@ -2,7 +2,7 @@ name: Auto Renew Bot-hosting v2
 
 on:
   schedule:
-    - cron: '*/15 * * * *' # 临时测试：每15分钟触发一次，确认后可改回
+    - cron: '0 8 * * *' # 每天UTC+0 8点
   workflow_dispatch:
 
 jobs:
