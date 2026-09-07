@@ -10,10 +10,10 @@
 
 | Secret 名称         | 是否必填 | 说明                                              |
 |---------------------|----------|---------------------------------------------------|
-| EMAIL              | ❌ 可选  | 用于通知使用的Email,可随意填写                          |
+| EMAIL              | ❌ 可选  | 通知里显示的登录账户；不填则回退 `SMTP_CONFIG.to`，不影响登录 |
 | SESSION_TOKEN      | ❌ 可选  | Bot-hosting session_token，cookie里获取               |
 | DISCORD_TOKEN      | ✅ 必填  | Discord Token，SESSION_TOKEN失效时自动OAuth登录        |
-| GH_TOKEN           | ❌ 可选  | GitHub(classic) token,用于自动更新session_token,以ghp_xxx开头|
+| GH_TOKEN           | ✅ 强烈建议 | GitHub classic PAT，**只勾 `repo`**。登录成功后强制写回 `SESSION_TOKEN`；不配则 cookie 过期后无法自动续 |
 | NODE_LINK          | ❌ 可选  | 代理链接（如 vless:// vmess:// trojan:// hysteria2:// tuic:// anytls:// socks5:// )|
 | TG_BOT_TOKEN       | ❌ 可选  | Telegram Bot Token（用于发送通知）                      |
 | TG_CHAT_ID         | ❌ 可选  | Telegram Chat ID（接收通知的用户或群组 ID）               |
@@ -41,7 +41,7 @@
 <img width="1200" height="600" alt="image" src="https://github.com/user-attachments/assets/7276d62d-31ff-452c-9e13-165af8323f53" />
 
 
-> **作用**：当 `SESSION_TOKEN` 过期导致登录失败时，脚本会自动使用 Discord Token 走 OAuth 流程重新登录，并自动更新 `SESSION_TOKEN` Secret，实现永久免维护。
+> **作用**：当 `SESSION_TOKEN` 过期时，脚本会先清掉旧 cookie，再用 Discord Token 走 OAuth 重新登录，并**强制**把新的 `SESSION_TOKEN` 写回 Secrets。这需要配置 `GH_TOKEN`。历史失败里 Discord 往往已经拿到授权码，却被过期 cookie 带进 `error=disconnect`；清 cookie + 强制写回就是为了打断这个循环。
 
 
 ### 获取 `GH_TOKEN`(GitHub Personal Access Token)
@@ -54,10 +54,14 @@
 4：点击 Generate new token → Generate new token (classic)。
 
 填写信息：
-- Note：起一个描述性名称（如 my-token）。
-- Expiration：选择过期时间（建议选No expiration永不过期）。
-- Select scopes：勾选所需权限（不知道如何勾选就全部勾选）。
-- 点击 Generate token，立即复制并妥保存生成的 token（离开页面后不能再查看）。
+- Note：起一个描述性名称（如 bothosting-secret-update）。
+- Expiration：建议选 **No expiration**（PAT 过期后 cookie 无法自动写回）。
+- Select scopes：**只勾 `repo`**，不要全选。
+- 点击 Generate token，立即复制并妥善保存（离开页面后不能再查看）。
+
+`GITHUB_TOKEN`（Actions 自带）不能改 Secrets，必须用上面这个 PAT，Secret 名称为 `GH_TOKEN`。
+
+登录成功后的日志应出现 `SESSION_TOKEN 已写回 Secrets`。登录失败时 workflow 会标红。
 
 ## 注意事项
 * 必填变量必须要填写
@@ -65,6 +69,7 @@
 * 自动续期不代表可以无底线的薅羊毛,不建议多账号
 * cron运行时间不一定准确,得根据实际到期时间修改,可在设置里暂停actions功能再开启
 * 脚本未捕获异常时也会尝试发「脚本异常」通知；通知失败会在 Actions 日志打 `::warning::`
+* 登录失败会让 job 失败（不再绿勾空转）；邮件会写明是 Discord 401 还是 `error=disconnect`
 * 工作流默认**保留最近 10 次** run 记录，便于对照定时/手动日志
 
 ## ⚠️ 免责声明

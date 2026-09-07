@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+agent-tools/
+login_*.png
+turnstile_passed.png

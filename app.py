@@ -6,13 +6,13 @@ import urllib.request, urllib.parse, urllib.error
 from datetime import datetime
 from seleniumbase import SB
 
-from notify import send_notification  # 通用通知（TG + SMTP），可被其它项目复用
+from notify import send_notification, load_smtp_config  # 通用通知（TG + SMTP），可被其它项目复用
 
 # 环境变量配置(可以直接私库在双引号里填写)
-EMAIL         = os.environ.get("EMAIL") or ""           # 展示用；也可作 SMTP 收件人提示，真正发信看 SMTP_CONFIG
+EMAIL         = os.environ.get("EMAIL") or ""           # 展示用；为空则回退 SMTP_CONFIG.to
 SESSION_TOKEN = (os.environ.get("SESSION_TOKEN") or "").strip()   # session token，默认登录方式,非必须
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or ""   # Discord Token 备用登录方式, 失败时才使用,必须填写
-GH_TOKEN      = os.environ.get("GH_TOKEN") or ""        # GitHub PAT token,用于自动更新session token,可选
+GH_TOKEN      = os.environ.get("GH_TOKEN") or ""        # GitHub classic PAT（repo 权限），登录成功后强制写回 SESSION_TOKEN
 # 通知：见 notify.py
 #   Telegram: TG_BOT_TOKEN + TG_CHAT_ID（或 TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID）
 #   邮件:     SMTP_CONFIG（JSON，与 dnshe-renewal 相同） 
@@ -43,6 +43,9 @@ COOKIES = {
 
 # 记录本次登录方式（用于通知）
 _LOGIN_METHOD = "SESSION_TOKEN"
+_SESSION_PERSIST_MSG = "尚未写回 SESSION_TOKEN"
+_DISCORD_DETAIL = ""
+_LAST_FAIL_URL = ""
 
 # 获取cookie到期时间
 def get_cookie_info(sb, name):
@@ -55,17 +58,118 @@ def get_cookie_info(sb, name):
             return value, expiry_dt
     return None, None
 
-# 检查是否需要更新cookie
-def should_update_cookie(new_value, old_value, expiry_dt, days_threshold=3):
-    if new_value is None:
+
+def clear_stale_session_cookies(sb, wipe_all_if_stuck: bool = False) -> None:
+    """删掉过期的 session_token / login，避免 bot-hosting 一直返回 error=disconnect。
+
+    Discord OAuth 开始前可以在删不掉时 wipe 全部 cookie。
+    打开回调 URL 前只删这两条，保留 /login/discord 种下的 OAuth 会话 cookie。
+    """
+    print("🧹 清除过期的 session_token / login Cookie...")
+    try:
+        url = sb.get_current_url() or ""
+    except Exception:
+        url = ""
+    if "bot-hosting.net" not in url:
+        try:
+            sb.open("https://bot-hosting.net/")
+            sb.wait_for_ready_state_complete()
+            sb.sleep(1)
+        except Exception as e:
+            print(f"⚠️ 无法打开 bot-hosting 以清 Cookie: {e}")
+            return
+
+    for name in ("session_token", "login"):
+        try:
+            sb.delete_cookie(name)
+            print(f"✅ 已删除 Cookie: {name}")
+        except Exception as e:
+            print(f"⚠️ delete_cookie({name}) 失败: {e}")
+
+    try:
+        leftover = [
+            c.get("name")
+            for c in (sb.get_cookies() or [])
+            if c.get("name") in ("session_token", "login")
+        ]
+    except Exception as e:
+        print(f"⚠️ 复查 Cookie 失败: {e}")
+        leftover = []
+
+    if leftover:
+        print(f"⚠️ 仍残留 Cookie: {leftover}")
+        if wipe_all_if_stuck:
+            try:
+                sb.delete_all_cookies()
+                print("✅ 已 delete_all_cookies")
+            except Exception as e:
+                print(f"⚠️ delete_all_cookies 失败: {e}")
+
+
+def persist_session_token(sb) -> bool:
+    """登录成功后强制把当前 session_token 写回 GitHub Secret，不依赖「值是否变化」。"""
+    global _SESSION_PERSIST_MSG
+    print("🔄 登录成功，写回 SESSION_TOKEN 到 Secrets")
+    new_token, token_expiry = get_cookie_info(sb, "session_token")
+    if token_expiry:
+        print(f"📅 浏览器 Cookie 到期时间: {token_expiry}")
+    if not new_token:
+        _SESSION_PERSIST_MSG = "浏览器中未读到 session_token，无法写回"
+        print(f"⚠️ {_SESSION_PERSIST_MSG}")
         return False
-    if new_value != old_value:
+    masked = new_token[:4] + "..." + new_token[-4:] if len(new_token) > 8 else "***"
+    print(f"📋 当前 session_token: {masked}")
+    if not GH_TOKEN:
+        _SESSION_PERSIST_MSG = "未设置 GH_TOKEN，无法写回 Secrets"
+        print(f"⚠️ {_SESSION_PERSIST_MSG}")
+        print(f"📋 请手动设置 SESSION_TOKEN = {masked}")
+        return False
+    if update_github_secret("SESSION_TOKEN", new_token):
+        _SESSION_PERSIST_MSG = "SESSION_TOKEN 已写回 Secrets"
+        print(f"✅ {_SESSION_PERSIST_MSG}")
         return True
-    if expiry_dt:
-        remaining = (expiry_dt - datetime.now()).total_seconds()
-        if remaining < days_threshold * 24 * 3600:
-            return True
+    _SESSION_PERSIST_MSG = "写回 Secrets 失败，请检查 GH_TOKEN 的 repo 权限"
+    print(f"⚠️ {_SESSION_PERSIST_MSG}")
     return False
+
+
+def _account_label() -> str:
+    raw = (EMAIL or "").strip()
+    if "@" not in raw:
+        try:
+            cfg = load_smtp_config()
+            if cfg and cfg.get("to"):
+                raw = str(cfg["to"]).split(",")[0].strip()
+        except Exception:
+            pass
+    if "@" in raw:
+        name, domain = raw.split("@", 1)
+        if len(name) > 4:
+            return f"{name[:2]}****{name[-2:]}@{domain}"
+        return f"{name}@{domain}"
+    if raw:
+        return raw[:2] + "****"
+    return "（未配置 EMAIL）"
+
+
+def _login_failure_message() -> str:
+    detail = (_DISCORD_DETAIL or "").strip()
+    fail_url = _LAST_FAIL_URL or ""
+    if "401" in detail or "Discord Token 已失效" in detail:
+        return detail
+    if "disconnect" in detail.lower() or "error=disconnect" in fail_url:
+        return (
+            "SESSION_TOKEN 已失效；Discord 已拿到授权码，"
+            "但 bot-hosting 返回 error=disconnect。"
+            "不要急着换 Discord Token；请看 Actions 是否已清除旧 Cookie。"
+        )
+    if "fraud" in detail.lower():
+        return detail
+    if not SESSION_TOKEN and DC_TOKEN:
+        return detail or "Discord OAuth 登录失败"
+    if SESSION_TOKEN and DC_TOKEN:
+        return detail or "SESSION_TOKEN 和 Discord OAuth 均失败"
+    return detail or "Cookie 已失效或页面异常"
 
 # 更新cookie到secrets
 def update_github_secret(secret_name, new_value):
@@ -110,23 +214,17 @@ def notify(message: str) -> bool:
 def format_notification(status: str, extra: str = "", error: str = "", expiry_date: str = "") -> str:
     local_time = time.gmtime(time.time() + 8 * 3600)
     now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
-    if '@' in EMAIL:
-        name, domain = EMAIL.split('@', 1)
-        if len(name) > 4:
-            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
-        else:
-            masked_email = f"{name}@{domain}"
-    else:
-        masked_email = EMAIL[:2] + '****' if EMAIL else "（未配置）"
+    masked_email = _account_label()
 
     lines = [
         "🇫🇮 Bot-hosting 续期通知",
         "",
         f"{status}",
         f"👤 登录账户: {masked_email}",
+        f"🔐 登录方式: {_LOGIN_METHOD}",
     ]
-    if _LOGIN_METHOD != "SESSION_TOKEN":
-        lines.append(f"🔐 登录方式: {_LOGIN_METHOD}")
+    if _SESSION_PERSIST_MSG:
+        lines.append(f"🔑 {_SESSION_PERSIST_MSG}")
     if expiry_date:
         lines.append(f"📅 到期时间: {expiry_date}")
     if extra:
@@ -229,6 +327,7 @@ def capture_discord_state(sb) -> str:
 
 def discord_authorize(state: str) -> str:
     """用 DC_TOKEN 直接完成 Discord 侧授权，返回跳转回 bot-hosting.net 的 location"""
+    global _DISCORD_DETAIL
     query = urllib.parse.urlencode({
         "client_id":     DISCORD_CLIENT_ID,
         "response_type": "code",
@@ -280,16 +379,23 @@ def discord_authorize(state: str) -> str:
     try:
         resp = requests.post(authorize_url, headers=headers, data=body, proxies=proxies, timeout=20)
         if resp.status_code != 200:
-            print(f"❌ Discord OAuth2 授权失败: HTTP {resp.status_code} - {resp.text[:300]}")
+            snippet = (resp.text or "")[:300]
+            print(f"❌ Discord OAuth2 授权失败: HTTP {resp.status_code} - {snippet}")
+            if resp.status_code == 401:
+                _DISCORD_DETAIL = "Discord Token 已失效（HTTP 401），需要更新 DISCORD_TOKEN"
+            else:
+                _DISCORD_DETAIL = f"Discord OAuth2 授权失败: HTTP {resp.status_code}"
             return ""
         resp_data = resp.json()
     except Exception as e:
         print(f"❌ Discord OAuth2 授权异常: {e}")
+        _DISCORD_DETAIL = f"Discord OAuth2 授权异常: {e}"
         return ""
 
     location = resp_data.get("location", "")
     if not location:
         print(f"❌ 授权响应中未找到 location 字段: {resp_data}")
+        _DISCORD_DETAIL = "Discord 授权响应中没有 location（未拿到回调 code）"
         return ""
 
     masked = re.sub(r"code=[^&]+", "code=***", location)
@@ -299,10 +405,12 @@ def discord_authorize(state: str) -> str:
 
 def do_discord_login(sb) -> bool:
     """通过 Discord Token 走完整 OAuth 流程登录 bot-hosting.net"""
+    global _DISCORD_DETAIL, _LAST_FAIL_URL
     print("\n🔑 通过 Discord Token 登录...")
 
     state = capture_discord_state(sb)
     if not state:
+        _DISCORD_DETAIL = "未能从 Discord 落地页解析 OAuth state"
         sb.save_screenshot("login_no_state.png")
         return False
 
@@ -310,19 +418,25 @@ def do_discord_login(sb) -> bool:
     if not location:
         return False
 
+    # 只去掉过期 session，保留刚才 /login/discord 种下的 OAuth cookie
+    clear_stale_session_cookies(sb, wipe_all_if_stuck=False)
+
     print("↩️ 携带授权码打开回调链接...")
     sb.uc_open_with_reconnect(location, reconnect_time=4)
     time.sleep(3)
 
     url = sb.get_current_url()
+    _LAST_FAIL_URL = url
 
     if "/error/banned" in url:
         print("🚫 账号已被封禁")
+        _DISCORD_DETAIL = "账号已被 bot-hosting 封禁"
         sb.save_screenshot("login_banned.png")
         return False
 
     if "bot-hosting.net" not in url:
         print(f"❌ 回调后未跳转至 bot-hosting.net，当前 URL：{url}")
+        _DISCORD_DETAIL = f"回调后未回到 bot-hosting.net：{url}"
         sb.save_screenshot("login_no_redirect.png")
         return False
 
@@ -332,18 +446,28 @@ def do_discord_login(sb) -> bool:
         body_text = ""
     if "fraud" in body_text.lower():
         print("🚫 触发风控（fraud attempt），可能是 IP 被拦截")
+        _DISCORD_DETAIL = "触发风控（fraud attempt），可能是代理 IP 被拦截"
         sb.save_screenshot("login_fraud.png")
         return False
 
     for _ in range(30):
         url = sb.get_current_url()
+        _LAST_FAIL_URL = url
         path = urllib.parse.urlparse(url).path
+        if "error=disconnect" in url:
+            continue
         if "bot-hosting.net" in url and path != "/login" and not path.startswith("/login/discord"):
             print(f"✅ Discord OAuth 登录成功！当前页面：{url}")
             return True
         time.sleep(0.5)
 
     print(f"❌ 登录超时或未跳转成功，最终停留在：{url}")
+    if "error=disconnect" in (url or ""):
+        _DISCORD_DETAIL = (
+            "Discord 已拿到授权码，但回调停留在 error=disconnect"
+        )
+    else:
+        _DISCORD_DETAIL = f"Discord 回调超时，停留在：{url}"
     try:
         body_text = sb.get_text("body")
         print(f"📄 页面正文片段：{body_text[:200].strip()!r}")
@@ -417,7 +541,7 @@ def run() -> None:
     else:
         print("🍭 未使用代理，直连访问")
 
-    global _LOGIN_METHOD
+    global _LOGIN_METHOD, _LAST_FAIL_URL, _DISCORD_DETAIL
 
     with SB(**sb_kwargs) as sb:
         try:
@@ -451,6 +575,7 @@ def run() -> None:
                     login_ok = True
                     print("✅ SESSION_TOKEN 登录成功, 当前已到达账单页")
                 else:
+                    _LAST_FAIL_URL = current_url or ""
                     print(f"❌ SESSION_TOKEN 登录失败，当前URL: {current_url}, 当前标题: {current_title}")
             except Exception as e:
                 # 例如 UnableToSetCookieException：不再让整个 job 直接崩，交给 Discord 备用登录
@@ -460,6 +585,7 @@ def run() -> None:
         if not login_ok and DC_TOKEN:
             _LOGIN_METHOD = "Discord Token"
             print("\n🔄 SESSION_TOKEN 登录失败或未配置，尝试 Discord OAuth 登录...")
+            clear_stale_session_cookies(sb, wipe_all_if_stuck=True)
             if do_discord_login(sb):
                 print("🌐 访问 https://bot-hosting.net/a/billings ...")
                 sb.open("https://bot-hosting.net/a/billings")
@@ -469,25 +595,30 @@ def run() -> None:
                 current_title = sb.get_title()
                 print(f"📝 当前URL: {current_url}, Title: {current_title}")
 
-                if "a/billings" in current_url:
+                if "a/billings" in current_url and "error=" not in current_url:
                     login_ok = True
                     print("✅ Discord OAuth 登录成功,当前已到达账单页")
                 else:
+                    _LAST_FAIL_URL = current_url or ""
                     print(f"❌ Discord OAuth 登录后仍未到达账单页，当前URL: {current_url}")
+                    if "error=disconnect" in (current_url or ""):
+                        _DISCORD_DETAIL = (
+                            "Discord 登录后仍停留在 error=disconnect"
+                        )
             else:
                 print("❌ Discord OAuth 登录失败")
 
         if not login_ok:
-            error_msg = "Cookie 已失效或页面异常"
-            if not SESSION_TOKEN and DC_TOKEN:
-                error_msg = "Discord OAuth 登录失败"
-            elif SESSION_TOKEN and DC_TOKEN:
-                error_msg = "SESSION_TOKEN 和 Discord OAuth 均失败"
+            error_msg = _login_failure_message()
             notify(format_notification("❌ 登录失败", error=error_msg))
-            return
+            print("::error::登录失败，workflow 以失败退出")
+            sys.exit(1)
 
         if _LOGIN_METHOD == "Discord Token":
-            print("ℹ️ 本次使用 Discord OAuth 登录，新的 SESSION_TOKEN 将自动更新到 Secrets")
+            print("ℹ️ 本次使用 Discord OAuth 登录，立即写回新的 SESSION_TOKEN")
+
+        # 登录成功立刻写回，避免后续 Turnstile/续期失败把新 cookie 丢掉
+        persist_session_token(sb)
 
         # 提取当前到期日期
         sb.sleep(2)
@@ -628,23 +759,8 @@ def run() -> None:
                     )
                 )
 
-        # 更新SESSION_TOKEN
-        print("🔄 检查 SESSION_TOKEN 是否需要更新")
-        new_token, token_expiry = get_cookie_info(sb, "session_token")
-        old_token = SESSION_TOKEN
-
-        if should_update_cookie(new_token, old_token, token_expiry):
-            print("🔄 SESSION_TOKEN 需要更新")
-            if GH_TOKEN:
-                if update_github_secret("SESSION_TOKEN", new_token):
-                    print("✅ SESSION_TOKEN 更新成功")
-                else:
-                    print("⚠️ 更新失败，请检查 GH_TOKEN 权限")
-            else:
-                print("⚠️ 未设置 GH_TOKEN，无法自动更新")
-                print(f"📋 请手动设置 SESSION_TOKEN = {new_token[:4]}...{new_token[-4:]}")
-        else:
-            print("✅ SESSION_TOKEN 无需更新")
+        # 续期过程中 cookie 可能被站点刷新，再写回一次
+        persist_session_token(sb)
 
         print("🏁 脚本执行完毕")
 
