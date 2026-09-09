@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, re, sys, time, json, requests, subprocess
+import os, re, sys, time, json, base64, requests, subprocess
 import urllib.request, urllib.parse, urllib.error
 from datetime import datetime
 from seleniumbase import SB
@@ -12,7 +12,7 @@ from notify import send_notification, load_smtp_config  # 通用通知（TG + SM
 EMAIL         = os.environ.get("EMAIL") or ""           # 展示用；为空则回退 SMTP_CONFIG.to
 SESSION_TOKEN = (os.environ.get("SESSION_TOKEN") or "").strip()   # session token，默认登录方式,非必须
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or ""   # Discord Token 备用登录方式, 失败时才使用,必须填写
-GH_TOKEN      = os.environ.get("GH_TOKEN") or ""        # GitHub classic PAT（repo 权限），登录成功后强制写回 SESSION_TOKEN
+GH_TOKEN      = os.environ.get("GH_TOKEN") or ""        # GitHub classic PAT（repo 权限），到期前写回 SESSION_TOKEN
 # 通知：见 notify.py
 #   Telegram: TG_BOT_TOKEN + TG_CHAT_ID（或 TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID）
 #   邮件:     SMTP_CONFIG（JSON，与 dnshe-renewal 相同） 
@@ -43,9 +43,10 @@ COOKIES = {
 
 # 记录本次登录方式（用于通知）
 _LOGIN_METHOD = "SESSION_TOKEN"
-_SESSION_PERSIST_MSG = "尚未写回 SESSION_TOKEN"
+_SESSION_PERSIST_MSG = "尚未检查 SESSION_TOKEN 写回"
 _DISCORD_DETAIL = ""
 _LAST_FAIL_URL = ""
+_KNOWN_SESSION_TOKEN = SESSION_TOKEN  # 进程内已写回的值，避免 Discord 后重复 gh secret set
 
 # 获取cookie到期时间
 def get_cookie_info(sb, name):
@@ -57,6 +58,66 @@ def get_cookie_info(sb, name):
             expiry_dt = datetime.fromtimestamp(expiry_ts) if expiry_ts else None
             return value, expiry_dt
     return None, None
+
+
+def refresh_before_hours() -> int:
+    """剩余不足该小时数才写回 Secret。默认 48，可用 SESSION_REFRESH_BEFORE_HOURS 覆盖。"""
+    try:
+        return int(os.environ.get("SESSION_REFRESH_BEFORE_HOURS", "48") or "48")
+    except (TypeError, ValueError):
+        return 48
+
+
+def token_seconds_left(token: str):
+    """读 JWT exp，不校验签名（与 puratya-renew 相同）。解析失败返回 None。"""
+    try:
+        parts = (token or "").split(".")
+        if len(parts) < 2:
+            return None
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
+        exp = data.get("exp")
+        if exp is None:
+            return None
+        return int(exp) - int(time.time())
+    except Exception:
+        return None
+
+
+def session_seconds_left(token: str, expiry_dt):
+    """综合 JWT exp 与浏览器 Cookie expiry，取更短的剩余秒数。"""
+    jwt_left = token_seconds_left(token)
+    cookie_left = None
+    if expiry_dt:
+        cookie_left = (expiry_dt - datetime.now()).total_seconds()
+    candidates = [x for x in (jwt_left, cookie_left) if x is not None]
+    if not candidates:
+        return None
+    return min(candidates)
+
+
+def should_write_session_token(new_token, old_token, seconds_left, force: bool = False):
+    """是否写回 SESSION_TOKEN。返回 (should_write, reason)。
+
+    对齐 puratya-renew：有效期不足阈值才换票；Discord 换到的新票强制写回。
+    """
+    if force:
+        return True, "Discord 登录换到新 session，强制写回"
+    if not new_token:
+        return False, "浏览器中未读到 session_token，无法写回"
+    if new_token != (old_token or "").strip():
+        return True, "session_token 值已变化，写回 Secrets"
+    hours_limit = refresh_before_hours()
+    if seconds_left is None:
+        return False, "未读到有效期且 token 未变化，跳过写回"
+    hours_left = seconds_left / 3600.0
+    if seconds_left < hours_limit * 3600:
+        return True, (
+            f"session_token 剩余约 {hours_left:.1f} 小时（<{hours_limit}h），写回 Secrets"
+        )
+    return False, (
+        f"session_token 剩余约 {hours_left:.1f} 小时（≥{hours_limit}h），无需写回"
+    )
 
 
 def clear_stale_session_cookies(sb, wipe_all_if_stuck: bool = False) -> None:
@@ -106,16 +167,28 @@ def clear_stale_session_cookies(sb, wipe_all_if_stuck: bool = False) -> None:
                 print(f"⚠️ delete_all_cookies 失败: {e}")
 
 
-def persist_session_token(sb) -> bool:
-    """登录成功后强制把当前 session_token 写回 GitHub Secret，不依赖「值是否变化」。"""
-    global _SESSION_PERSIST_MSG
-    print("🔄 登录成功，写回 SESSION_TOKEN 到 Secrets")
+def persist_session_token(sb, force: bool = False) -> bool:
+    """按有效期写回 SESSION_TOKEN：剩余 < 48h、值变化、或 Discord 换票时才 gh secret set。"""
+    global _SESSION_PERSIST_MSG, _KNOWN_SESSION_TOKEN
+    print("🔄 检查 SESSION_TOKEN 是否需要写回 Secrets")
     new_token, token_expiry = get_cookie_info(sb, "session_token")
+    seconds_left = session_seconds_left(new_token or "", token_expiry)
     if token_expiry:
         print(f"📅 浏览器 Cookie 到期时间: {token_expiry}")
+    jwt_left = token_seconds_left(new_token or "")
+    if jwt_left is not None:
+        print(f"📅 JWT exp 剩余约 {jwt_left / 3600.0:.1f} 小时")
+    if seconds_left is not None:
+        print(f"📅 session_token 剩余约 {seconds_left / 3600.0:.1f} 小时")
+
+    should, reason = should_write_session_token(
+        new_token, _KNOWN_SESSION_TOKEN, seconds_left, force=force
+    )
+    print(f"ℹ️ {reason}")
+    _SESSION_PERSIST_MSG = reason
+    if not should:
+        return False
     if not new_token:
-        _SESSION_PERSIST_MSG = "浏览器中未读到 session_token，无法写回"
-        print(f"⚠️ {_SESSION_PERSIST_MSG}")
         return False
     masked = new_token[:4] + "..." + new_token[-4:] if len(new_token) > 8 else "***"
     print(f"📋 当前 session_token: {masked}")
@@ -125,6 +198,7 @@ def persist_session_token(sb) -> bool:
         print(f"📋 请手动设置 SESSION_TOKEN = {masked}")
         return False
     if update_github_secret("SESSION_TOKEN", new_token):
+        _KNOWN_SESSION_TOKEN = new_token
         _SESSION_PERSIST_MSG = "SESSION_TOKEN 已写回 Secrets"
         print(f"✅ {_SESSION_PERSIST_MSG}")
         return True
@@ -617,8 +691,8 @@ def run() -> None:
         if _LOGIN_METHOD == "Discord Token":
             print("ℹ️ 本次使用 Discord OAuth 登录，立即写回新的 SESSION_TOKEN")
 
-        # 登录成功立刻写回，避免后续 Turnstile/续期失败把新 cookie 丢掉
-        persist_session_token(sb)
+        # Discord 换票强制写回；SESSION_TOKEN 登录则仅在剩余 < 48h 或值变化时写回
+        persist_session_token(sb, force=(_LOGIN_METHOD == "Discord Token"))
 
         # 提取当前到期日期
         sb.sleep(2)
@@ -759,7 +833,7 @@ def run() -> None:
                     )
                 )
 
-        # 续期过程中 cookie 可能被站点刷新，再写回一次
+        # 续期过程中 cookie 可能被站点刷新；仍按 48h / 值变化判断，避免每天打 Secrets
         persist_session_token(sb)
 
         print("🏁 脚本执行完毕")

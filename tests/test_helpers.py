@@ -4,6 +4,7 @@
 
 import os
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -57,12 +58,70 @@ def test_login_failure_401_asks_discord_token():
     assert "DISCORD_TOKEN" in msg
 
 
+def _jwt_with_exp(exp: int) -> str:
+    import base64
+    import json
+
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).rstrip(b"=").decode()
+    return f"aaa.{payload}.sig"
+
+
+def test_token_seconds_left_reads_jwt_exp():
+    exp = int(time.time()) + 3 * 3600
+    left = app.token_seconds_left(_jwt_with_exp(exp))
+    assert left is not None
+    assert 2.5 * 3600 < left < 3.5 * 3600
+
+
+def test_token_seconds_left_opaque_token():
+    assert app.token_seconds_left("not-a-jwt") is None
+
+
+def test_should_write_when_under_48h():
+    os.environ["SESSION_REFRESH_BEFORE_HOURS"] = "48"
+    should, reason = app.should_write_session_token("same", "same", 47 * 3600)
+    assert should is True
+    assert "<48h" in reason
+
+
+def test_should_skip_when_over_48h():
+    os.environ["SESSION_REFRESH_BEFORE_HOURS"] = "48"
+    should, reason = app.should_write_session_token("same", "same", 72 * 3600)
+    assert should is False
+    assert "无需写回" in reason
+
+
+def test_should_write_when_value_changed():
+    should, reason = app.should_write_session_token("new-token", "old-token", 99 * 3600)
+    assert should is True
+    assert "值已变化" in reason
+
+
+def test_should_force_write_after_discord():
+    should, reason = app.should_write_session_token("new-token", "old-token", 99 * 3600, force=True)
+    assert should is True
+    assert "强制写回" in reason
+
+
+def test_should_skip_when_expiry_unknown_and_unchanged():
+    should, reason = app.should_write_session_token("same", "same", None)
+    assert should is False
+    assert "未读到有效期" in reason
+
+
 if __name__ == "__main__":
     tests = [
         test_account_label_falls_back_when_email_empty,
         test_account_label_masks_email,
         test_login_failure_disconnect_does_not_ask_new_discord_token,
         test_login_failure_401_asks_discord_token,
+        test_token_seconds_left_reads_jwt_exp,
+        test_token_seconds_left_opaque_token,
+        test_should_write_when_under_48h,
+        test_should_skip_when_over_48h,
+        test_should_write_when_value_changed,
+        test_should_force_write_after_discord,
+        test_should_skip_when_expiry_unknown_and_unchanged,
     ]
     for fn in tests:
         fn()

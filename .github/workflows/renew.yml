@@ -40,6 +40,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           SESSION_TOKEN: ${{ secrets.SESSION_TOKEN }}
+          SESSION_REFRESH_BEFORE_HOURS: ${{ vars.SESSION_REFRESH_BEFORE_HOURS }}
           # 通知（与 notify.py / dnshe-renewal 对齐；可并存）
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
