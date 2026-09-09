@@ -81,20 +81,22 @@ def test_should_write_when_under_48h():
     os.environ["SESSION_REFRESH_BEFORE_HOURS"] = "48"
     should, reason = app.should_write_session_token("same", "same", 47 * 3600)
     assert should is True
-    assert "<48h" in reason
+    assert "< 48h" in reason
 
 
 def test_should_skip_when_over_48h():
     os.environ["SESSION_REFRESH_BEFORE_HOURS"] = "48"
     should, reason = app.should_write_session_token("same", "same", 72 * 3600)
     assert should is False
-    assert "无需写回" in reason
+    assert "未写回" in reason
 
 
-def test_should_write_when_value_changed():
-    should, reason = app.should_write_session_token("new-token", "old-token", 99 * 3600)
-    assert should is True
-    assert "值已变化" in reason
+def test_should_not_write_when_value_changed_but_still_fresh():
+    os.environ["SESSION_REFRESH_BEFORE_HOURS"] = "48"
+    should, reason = app.should_write_session_token("new-token", "old-token", 168 * 3600)
+    assert should is False
+    assert "未写回" in reason
+    assert "168.0" in reason
 
 
 def test_should_force_write_after_discord():
@@ -107,6 +109,7 @@ def test_should_skip_when_expiry_unknown_and_unchanged():
     should, reason = app.should_write_session_token("same", "same", None)
     assert should is False
     assert "未读到有效期" in reason
+    assert "未写回" in reason
 
 
 if __name__ == "__main__":
@@ -119,7 +122,7 @@ if __name__ == "__main__":
         test_token_seconds_left_opaque_token,
         test_should_write_when_under_48h,
         test_should_skip_when_over_48h,
-        test_should_write_when_value_changed,
+        test_should_not_write_when_value_changed_but_still_fresh,
         test_should_force_write_after_discord,
         test_should_skip_when_expiry_unknown_and_unchanged,
     ]

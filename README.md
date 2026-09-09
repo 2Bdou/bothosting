@@ -13,7 +13,7 @@
 | EMAIL              | ❌ 可选  | 通知里显示的登录账户；不填则回退 `SMTP_CONFIG.to`，不影响登录 |
 | SESSION_TOKEN      | ❌ 可选  | Bot-hosting session_token，cookie里获取               |
 | DISCORD_TOKEN      | ✅ 必填  | Discord Token，SESSION_TOKEN失效时自动OAuth登录        |
-| GH_TOKEN           | ✅ 强烈建议 | GitHub classic PAT，**只勾 `repo`**。`SESSION_TOKEN` 剩余不足 48 小时、值变化或 Discord 换票时写回 |
+| GH_TOKEN           | ✅ 强烈建议 | GitHub classic PAT，**只勾 `repo`**。仅当 `SESSION_TOKEN` 剩余不足 48 小时，或 Discord 换票时写回 |
 | NODE_LINK          | ❌ 可选  | 代理链接（如 vless:// vmess:// trojan:// hysteria2:// tuic:// anytls:// socks5:// )|
 | TG_BOT_TOKEN       | ❌ 可选  | Telegram Bot Token（用于发送通知）                      |
 | TG_CHAT_ID         | ❌ 可选  | Telegram Chat ID（接收通知的用户或群组 ID）               |
@@ -41,7 +41,7 @@
 <img width="1200" height="600" alt="image" src="https://github.com/user-attachments/assets/7276d62d-31ff-452c-9e13-165af8323f53" />
 
 
-> **作用**：当 `SESSION_TOKEN` 过期时，脚本会先清掉旧 cookie，再用 Discord Token 走 OAuth 重新登录，并**立刻写回**新的 `SESSION_TOKEN`。SESSION_TOKEN 登录成功时，只在 **剩余有效期不足 48 小时**（或 cookie 值变了）才写回 Secrets，机制对齐 [puratya-renew](https://github.com/2Bdou/puratya-renew)。可用环境变量 `SESSION_REFRESH_BEFORE_HOURS` 改阈值（默认 `48`）。这需要配置 `GH_TOKEN`。
+> **作用**：当 `SESSION_TOKEN` 过期时，脚本会先清掉旧 cookie，再用 Discord Token 走 OAuth 重新登录，并**立刻写回**新的 `SESSION_TOKEN`。SESSION_TOKEN 登录成功时，**只在剩余有效期不足 48 小时才写回**（站点每次访问都可能换 JWT，值变化不会单独触发写回）。机制对齐 [puratya-renew](https://github.com/2Bdou/puratya-renew)。可用 `SESSION_REFRESH_BEFORE_HOURS` 改阈值（默认 `48`）。这需要配置 `GH_TOKEN`。
 
 
 ### 获取 `GH_TOKEN`(GitHub Personal Access Token)
@@ -61,7 +61,7 @@
 
 `GITHUB_TOKEN`（Actions 自带）不能改 Secrets，必须用上面这个 PAT，Secret 名称为 `GH_TOKEN`。
 
-有效期仍充足时日志会写 `无需写回`；不足 48 小时、token 值变化或 Discord 换票后应出现 `SESSION_TOKEN 已写回 Secrets`。登录失败时 workflow 会标红。
+日志里会有一块 `SESSION_TOKEN 写回`，`结果: 已写回 Secrets` 或 `结果: 未写回`。剩余 ≥ 48 小时应是未写回；不足 48 小时或 Discord 换票才是已写回。登录失败时 workflow 会标红。
 
 ## 注意事项
 * 必填变量必须要填写
