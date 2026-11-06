@@ -1,13 +1,10 @@
 ## 🚀 Bot-hosting 自动续期（GitHub Actions）
 
-这是一个基于 GitHub Actions 的自动化脚本，用于定时登录自动续期 [Bot-hosting](https://bot-hosting.net) 服务。
+这是一个基于 GitHub Actions 的自动化脚本，用于定时登录自动续期 
 
-⚠️ 有cf盾,太垃圾的机房节点可能过不了，建议用稍微干净点的节点,[B2proxy住宅代理](https://www.b2proxy.com/signup?code=0F5133)
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
-> 登录与续期逻辑：来自 [eooce/Auto-Renew-Bothosting](https://github.com/eooce/Auto-Renew-Bothosting)（邮箱 + 密码登录，密码不过期，稳定）
-> 通知渠道：沿用 [2Bdou/bothosting](https://github.com/2Bdou/bothosting) 的 `notify.py`（Telegram + SMTP，可并存）
 > 之前用 Discord Token 登录的方式仍然可用，Discord token 有时会变化，用账号密码更稳定。
 
 ━━━━━━━━━━━━━━━━━━━━━━
