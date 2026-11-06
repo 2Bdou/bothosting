@@ -299,3 +299,288 @@ def get_current_ip(proxy_server: str = "") -> str:
     proxies = None
     if proxy_server:
         proxies = {"http": proxy_server, "https": proxy_server}
+    response = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+    response.raise_for_status()
+    return response.text.strip()
+
+# 时间格式化
+def format_countdown(countdown_str: str) -> str:
+    try:
+        h, m, _ = countdown_str.split(':')
+        h = int(h)
+        m = int(m)
+        if h > 0:
+            return f"{h}h{m}min"
+        else:
+            return f"{m}min"
+    except:
+        return countdown_str
+
+# 归一化日期为 YYYY/MM/DD
+def normalize_date(date_str: str) -> str:
+    parts = date_str.split('/')
+    if len(parts) == 3:
+        if len(parts[2]) == 4:   # MM/DD/YYYY
+            return f"{parts[2]}/{int(parts[0]):02d}/{int(parts[1]):02d}"
+        if len(parts[0]) == 4:   # YYYY/MM/DD
+            return f"{parts[0]}/{int(parts[1]):02d}/{int(parts[2]):02d}"
+    return date_str
+
+DATE_RE = r"(\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}/\d{4})"
+
+# 获取过期日期
+def extract_expiry_date(page_source: str) -> str:
+    patterns = [
+        r"[Ee]xpires\s*[:\-]?\s*" + DATE_RE,   # Expires 10/24/2026. Renew manually to extend it for 4 days.
+        DATE_RE,                                # 兜底: 账单页纯文本中通常只有到期日期
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, page_source)
+        if match:
+            return normalize_date(match.group(1))
+    return None
+
+# 优先从 DOM 的 st-meta 元素提取到期日期 (不依赖页面语言)
+def get_expiry_from_dom(sb) -> str:
+    for selector in ['span.st-meta', '.st-meta', '[class*="st-meta"]']:
+        try:
+            if sb.is_element_present(selector):
+                match = re.search(DATE_RE, sb.get_text(selector))
+                if match:
+                    return normalize_date(match.group(1))
+        except Exception:
+            pass
+    return None
+
+# 主流程
+def main():
+    print("#" * 25)
+    print("   Bot-hosting 自动续期")
+    print("#" * 25)
+
+    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
+    PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
+    HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true" 
+
+    sb_kwargs = {"uc": True, "headless": HEADLESS, "locale_code": "en-US"}
+
+    if IS_PROXY:
+        print(f"🔗 挂载代理: {PROXY_SERVER}")
+        sb_kwargs["proxy"] = PROXY_SERVER
+    else:
+        print("🍭 未使用代理，直连访问")
+
+    with SB(**sb_kwargs) as sb:
+        try:
+            ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
+            print(f"📍 当前出口IP: {ip}")
+        except Exception as e:
+            print(f"⚠️ 获取出口 IP 失败: {e}")
+
+        login_ok = False
+
+        # 账号密码登录（密码不过期，唯一登录方式；整段兜异常，失败只标记 login_ok=False 走统一失败通知）
+        if EMAIL and PASSWORD:
+            print("🚀 启动浏览器...")
+            try:
+                print(f"🌐 访问 {BASE_URL}/login")
+                sb.open(f"{BASE_URL}/login")
+                sb.wait_for_ready_state_complete()
+                sb.sleep(3)
+                sb.click('button[type="submit"]') # 点击 Continue with email 按钮
+                sb.sleep(12)  # 等待页面加载
+                print(f"📧 填写邮箱...")
+                sb.input('input[type="email"]', EMAIL)
+                sb.sleep(1)
+                print(f"🔑 填写密码...")
+                sb.input('input[type="password"]', PASSWORD)
+                sb.sleep(3)
+
+                if wait_turnstile_present(sb):
+                    if not handle_turnstile(sb):
+                        print("❌ 登录界面的 Turnstile 验证失败，尝试兜底点击...")
+                        try:
+                            sb.cdp.click_captcha()  # 再次尝试点击 Turnstile 验证
+                            sb.sleep(4)
+                        except Exception as e:
+                            print(f"⚠️ 兜底点击失败: {e}")
+                        # sb.save_screenshot("turnstile_failed.png")
+                else:
+                    print("ℹ️ 未检测到 Turnstile")
+                sb.sleep(1)
+                sb.click('button[type="submit"]') # 点击登录按钮
+                print("🖱️ 提交登录按钮")
+                sb.sleep(6)  # 等待页面加载
+                sb.wait_for_ready_state_complete()
+                sb.open(f"{BASE_URL}/a/billings")
+                sb.wait_for_ready_state_complete()
+                sb.sleep(3)
+                current_url = sb.get_current_url()
+                current_title = sb.get_title()
+                print(f"📝 当前URL: {current_url}, Title: {current_title}")
+
+                if "/a/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
+                    login_ok = True
+                    print("✅ Password 登录成功,当前已到达账单页")
+                else:
+                    print(f"❌ Password 登录后仍未到达账单页，当前URL: {current_url}")
+            except Exception as e:
+                    print(f"❌ Password 登录过程异常: {type(e).__name__}: {str(e)[:150]}")
+
+        if not login_ok:
+            send_telegram_message(format_notification("❌ 登录失败", error="Password 登录失败"))
+            return
+
+        # 提取当前到期日期
+        sb.sleep(3)
+        try:
+            page_source = sb.get_page_text() + "\n" + sb.get_page_source()
+        except Exception:
+            page_source = sb.get_page_source()
+        current_expiry = get_expiry_from_dom(sb) or extract_expiry_date(page_source)
+        if current_expiry:
+            print(f"📅 当前到期日期: {current_expiry}")
+        else:
+            print("⚠️ 未能提取当前到期日期")
+
+        # 寻找外部续期按钮
+        outer_renew_selector = None
+        countdown_text = None
+        possible_selectors = [
+            'button:contains("Renew")',
+            'button:contains("Renew free plan")',
+            'a:contains("Renew")',
+            '[class*="renew"]',
+            '[class*="Renew"]',
+        ]
+
+        for selector in possible_selectors:
+            try:
+                if sb.is_element_visible(selector):
+                    button_text = sb.get_text(selector)
+                    # "Renew in HH:MM:SS" / "Renewal cooldown HH:MM:SS" 都表示冷却中, 时间为距可续期的剩余时长
+                    match = re.search(r"(?:Renew in|Renewal cooldown)\s+(\d{1,2}:\d{2}:\d{2})", button_text, re.I)
+                    if match:
+                        countdown_text = match.group(1)
+                        print(f"⏳ 续期冷却中, 未到续期时间: '{button_text}'")
+                        break
+                    elif "Renew" in button_text:
+                        outer_renew_selector = selector
+                        print(f"✅ 续期按钮可用: '{button_text}'")
+                        break
+            except Exception as e:
+                pass
+
+        # 点击外部续期按钮等待弹窗
+        if outer_renew_selector:
+            print("🔄 点击外部续期按钮，等待验证窗口...")
+            try:
+                sb.sleep(2)
+                sb.click(outer_renew_selector)
+                sb.sleep(15)  # 等待模态框加载，可能因网络因素加载慢
+            except Exception as e:
+                print(f"❌ 点击外部按钮失败: {e}")
+                send_telegram_message(format_notification("❌ 续期失败", error="点击外部续期按钮出错"))
+                return
+
+            # 处理弹窗中的 Turnstile
+            turnstile_passed = True  # 未检测到 Turnstile 时视为无需验证
+            if wait_turnstile_present(sb):
+                turnstile_passed = handle_turnstile(sb)
+                if not turnstile_passed:
+                    print("❌ Turnstile 验证失败，尝试兜底点击...")
+                    try:
+                        sb.cdp.click_captcha()  # 再次尝试点击 Turnstile 验证
+                        sb.sleep(4)
+                        turnstile_passed = bool(turnstile_token(sb))
+                    except Exception as e:
+                        print(f"⚠️ 兜底点击失败: {e}")
+                    # sb.save_screenshot("turnstile_failed.png")
+            else:
+                print("ℹ️ 未检测到 Turnstile")
+
+            if not turnstile_passed:
+                print("❌ Turnstile 验证最终未通过，脚本退出")
+                send_telegram_message(format_notification("❌ 续期失败", error="Turnstile 验证未通过"))
+                return
+
+            # 点击续期按钮
+            print("⏳ 等待续期按钮可用并点击...")
+            time.sleep(5) 
+
+            modal_button_clicked = False
+            try:
+                selector = 'div[role="dialog"] button.btn-primary' 
+                sb.click(selector, timeout=8)
+                modal_button_clicked = True
+                print("✅ 已点击续期按钮")
+            except Exception as e:
+                print(f"续期按钮点击失败: {e}")
+
+            print("⏳ 等待新的过期时间...")
+            sb.sleep(6)
+
+            # 提取新的到期日期和倒计时
+            try:
+                new_page_text = sb.get_page_text() + "\n" + sb.get_page_source()
+            except Exception:
+                new_page_text = sb.get_page_source()
+            new_expiry = get_expiry_from_dom(sb) or extract_expiry_date(new_page_text)
+            new_match = re.search(r"(?:Renewal cooldown|Renew in)\s+(\d{1,2}:\d{2}:\d{2})", new_page_text)
+            if new_match:
+                new_countdown = new_match.group(1)
+                print(f"✅ 续期成功！新的倒计时: {new_countdown}")
+                if new_expiry:
+                    print(f"📅 新的到期日期: {new_expiry}")
+                send_telegram_message(
+                    format_notification(
+                        "✅ 续期成功",
+                        extra=f"⏱️ 可续期时间: {format_countdown(new_countdown)}后",
+                        expiry_date=new_expiry or "（未获取到）"
+                    )
+                )
+            else:
+                if new_expiry and new_expiry != current_expiry:
+                    print(f"✅ 续期成功，到期日期已更新为: {new_expiry}")
+                    send_telegram_message(
+                        format_notification(
+                            "✅ 续期成功",
+                            extra="到期日期已更新",
+                            expiry_date=new_expiry
+                        )
+                    )
+                else:
+                    print("⚠️ 续期结果未知，到期日期未变化，请手动检查")
+                    send_telegram_message(
+                        format_notification(
+                            "⚠️ 续期可能未成功",
+                            extra="请登录后台检查",
+                            expiry_date=current_expiry or "（未获取到）"
+                        )
+                    )
+
+        else:
+            if countdown_text:
+                friendly = format_countdown(countdown_text)
+                print(f"⏳ 未到续期时间，倒计时: {countdown_text} ({friendly})")
+                send_telegram_message(
+                    format_notification(
+                        "⏳ 未到续期时间",
+                        extra=f"⏱️ 可续期时间: {friendly}后",
+                        expiry_date=current_expiry or "（未获取到）"
+                    )
+                )
+            else:
+                print("ℹ️ 未找到续期按钮或倒计时，状态未知")
+                send_telegram_message(
+                    format_notification(
+                        "ℹ️ 无需续期",
+                        extra="当前状态未知，请手动检查",
+                        expiry_date=current_expiry or "（未获取到）"
+                    )
+                )
+
+        print("🏁 脚本执行完毕")
+
+if __name__ == "__main__":
+    main()
