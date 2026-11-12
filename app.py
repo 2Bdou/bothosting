@@ -326,7 +326,8 @@ def normalize_date(date_str: str) -> str:
             return f"{parts[0]}/{int(parts[1]):02d}/{int(parts[2]):02d}"
     return date_str
 
-DATE_RE = r"(\d{4}/\d{1,2}/\d{1,2}|\d{1,2}/\d{1,2}/\d{4})"
+# 兼容三种日期格式: 12 Nov 2026 / 10/24/2026 / 2026-11-12
+DATE_RE = r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2})"
 
 # 获取过期日期
 def extract_expiry_date(page_source: str) -> str:
@@ -412,14 +413,14 @@ def main():
                 print("🖱️ 提交登录按钮")
                 sb.sleep(6)  # 等待页面加载
                 sb.wait_for_ready_state_complete()
-                sb.open(f"{BASE_URL}/a/billings")
+                sb.open(f"{BASE_URL}/dash/billings")
                 sb.wait_for_ready_state_complete()
                 sb.sleep(3)
                 current_url = sb.get_current_url()
                 current_title = sb.get_title()
                 print(f"📝 当前URL: {current_url}, Title: {current_title}")
 
-                if "/a/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
+                if "/dash/billings" in current_url and "/login" not in current_url and "error=" not in current_url:
                     login_ok = True
                     print("✅ Password 登录成功,当前已到达账单页")
                 else:
@@ -447,11 +448,9 @@ def main():
         outer_renew_selector = None
         countdown_text = None
         possible_selectors = [
-            'button:contains("Renew")',
+            'type:button("Renew free plan")',
             'button:contains("Renew free plan")',
-            'a:contains("Renew")',
-            '[class*="renew"]',
-            '[class*="Renew"]',
+            '[class*="btn btn-primary btn-sm"]',
         ]
 
         for selector in possible_selectors:
